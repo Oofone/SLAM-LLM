@@ -3,6 +3,7 @@ import os
 import fire
 import deepspeed
 import random
+import numpy as np
 import importlib
 
 # nn
@@ -48,6 +49,31 @@ import wandb
 import hydra
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from pathlib import Path
+
+
+class SkipDataLoader:
+    def __init__(self, dataloader, skip_steps):
+        self.dataloader = dataloader
+        self.skip_steps = skip_steps
+        self._skipped = False
+        self.logger = logging.getLogger()  
+        self.logger.setLevel(logging.INFO)
+
+    def __iter__(self):
+        it = iter(self.dataloader)
+        if not self._skipped and self.skip_steps > 0:
+            self.logger(f"Skipping {self.skip_steps} batches to resume mid-epoch...")
+            for _ in range(self.skip_steps):
+                try:
+                    next(it)
+                except StopIteration:
+                    break
+            self._skipped = True
+        return it
+
+    def __len__(self):
+        return len(self.dataloader)
+
 
 @hydra.main(config_name=None, version_base=None)
 def main_hydra(cfg: DictConfig):
@@ -142,9 +168,13 @@ def main(kwargs: DictConfig):
 
     model_factory = get_custom_model_factory(model_config, logger)
     model, tokenizer = model_factory(train_config, model_config, **kwargs)
-    parameters = filter(lambda p: p.requires_grad, model.parameters())
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    print("Pre-Deepspeed")
+    for name, param in model.named_parameters():
+        if param.dtype != torch.float32:
+            print(f"{name} not expected dtype; is {param.dtype}")
+
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # If you are facing problem from limited memory(<=256GB), you can try to replace the above code with the following code
     # for i in range(rank):
     #     while not os.path.isfile(f".{i}.done"):
@@ -158,13 +188,120 @@ def main(kwargs: DictConfig):
     # with open(f".{rank}.done", "w"):
     #     pass
 
-
     # Initialize the optimizer and learning rate scheduler
-    model_engine, _, _, _ = deepspeed.initialize(
-        model=model, model_parameters=parameters, config=deepspeed_config
-    )
+    lr = train_config.lr
+    lr_encoder = train_config.lr_encoder
+    lr_projector = train_config.lr_projector
+    lr_llm = train_config.lr_llm
+    my_optim = None
 
-    
+    if lr_encoder or lr_projector or lr_llm:
+        logger.info("Using specific lr for each component")
+        logger.info(
+            "lr_encoder: {}; lr_llm (LoRA): {}; lr_projector: {}.".format(
+                str(lr_encoder), str(lr_llm), str(lr_projector)))
+        param_groups = []
+        enc_param_names = []
+        projector_param_names = []
+        lora_param_names = []
+        if lr_encoder:
+            enc_params = []
+            for n, p in model.named_parameters():
+                if n.startswith("encoder.") and p.requires_grad:
+                    enc_params.append(p)
+                    enc_param_names.append(n)
+            logger.info(f"Trainable encoder params with LR {lr_encoder}: {len(enc_param_names)}")
+            param_groups.append({"params": enc_params, "lr": lr_encoder})
+        if lr_projector:
+            projector_params = []
+            for n, p in model.named_parameters():
+                if n.startswith("encoder_projector.") and p.requires_grad:
+                    projector_params.append(p)
+                    projector_param_names.append(n)
+            logger.info(f"Trainable adapter params with LR {lr_projector}: {len(projector_param_names)}")
+            param_groups.append({"params": projector_params, "lr": lr_projector})
+        if lr_llm:
+            lora_params = []
+            for n, p in model.named_parameters():
+                if "lora" in n.lower() and p.requires_grad:
+                    lora_params.append(p)
+                    lora_param_names.append(n)
+            logger.info(f"Trainable LLM LoRA params with LR {lr_llm}: {len(lora_param_names)}")
+            param_groups.append({"params": lora_params, "lr": lr_llm})
+        other_params = [p for n, p in model.named_parameters() if p.requires_grad and n not in enc_param_names + projector_param_names + lora_param_names]
+        if other_params:
+            param_groups.append({"params": other_params, "lr": lr})
+        # Default is Adam
+        opt_fn = torch.optim.Adam
+        if train_config.custom_optimizer == "adamw":
+            opt_fn = torch.optim.AdamW
+        my_optim = opt_fn(
+            params=param_groups,
+            weight_decay=train_config.weight_decay
+        )
+        logger.info("Original optimizer pre-deepspeed groups:")
+        for i, g in enumerate(my_optim.param_groups):
+            logger.info(f"Group {i}: lr = {g['lr']}, #params = {len(g['params'])}")
+        model_engine, _, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=my_optim,
+            model_parameters=param_groups,
+            config=deepspeed_config,
+        )
+        logger.info("Original optimizer groups:")
+        for i, g in enumerate(my_optim.param_groups):
+            logger.info(f"Group {i}: lr = {g['lr']}, #params = {len(g['params'])}")
+        logger.info("Deepspeed model.optimizer groups:")
+        for i, g in enumerate(model_engine.optimizer.param_groups):
+            logger.info(f"Group {i}: lr = {g['lr']}, #params = {len(g['params'])}")
+    else:
+        parameters = filter(lambda p: p.requires_grad, model.parameters())
+        model_engine, _, _, _ = deepspeed.initialize(
+            model=model, model_parameters=parameters, config=deepspeed_config
+        )
+    logger.info(f"LR Scheduler OG LRs: {model_engine.lr_scheduler.org_lrs}")
+
+    resume_skip_steps = 0
+    resume_epoch = 0
+    if train_config.get("resume_deepspeed_dir", None):
+        logger.info("Resuming Deepspeed Checkpoint with the following params:")
+        logger.info(f"load_module_strict=False")
+        logger.info(f"load_dir={train_config.get('resume_deepspeed_dir')}")
+        logger.info(f"load_module_only={train_config.get('resume_deepspeed_only_module', True)}")
+        logger.info(f"load_optimizer_states={train_config.get('resume_deepspeed_optimizer', False)}")
+        logger.info(f"load_lr_scheduler_states={train_config.get('resume_deepspeed_lr_scheduler', False)}")
+        model_engine.load_checkpoint(
+            load_module_strict=False,
+            load_dir=train_config.get("resume_deepspeed_dir"),
+            load_module_only=train_config.get("resume_deepspeed_only_module", True),
+            load_optimizer_states=train_config.get("resume_deepspeed_optimizer", False),
+            load_lr_scheduler_states=train_config.get("resume_deepspeed_lr_scheduler", False))
+
+        # Attempt restore training state
+        training_state_path = os.path.join(train_config.resume_deepspeed_dir, "training_state.pt")
+        if train_config.get("resume_training_state", False) and os.path.isfile(training_state_path):
+            state = torch.load(training_state_path, map_location="cpu", weights_only=True)
+            resume_epoch = state["epoch"]
+            resume_skip_steps = state["step"] + 1  # skip *after* this step
+
+            # Restore RNG states
+            torch.set_rng_state(state["rng_state"]["torch"])
+            torch.cuda.set_rng_state_all(state["rng_state"]["cuda"])
+            np.random.set_state(state["rng_state"]["numpy"])
+            random.setstate(state["rng_state"]["python"])
+
+            logger.info(f"Resuming from epoch={resume_epoch}, step={resume_skip_steps}")
+        else:
+            logger.warning(f"No training_state.pt found in {train_config.resume_deepspeed_dir}")
+
+    else:
+        logger.info("Skipping Resume Deepspeed Checkpoint")
+
+    print("Post-Deepspeed")
+    for name, param in model.named_parameters():
+        if param.dtype != torch.float32:
+            print(f"{name} not expected dtype; is {param.dtype}")
+
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
     # if (train_config.enable_fsdp or train_config.enable_ddp) and fsdp_config.pure_bf16:
     #     model.to(torch.bfloat16)
@@ -210,6 +347,8 @@ def main(kwargs: DictConfig):
         pin_memory=True,
         **train_dl_kwargs,
     )
+    if resume_skip_steps > 0:
+        train_dataloader = SkipDataLoader(train_dataloader, resume_skip_steps)
 
     eval_dataloader = None
     if train_config.run_validation:
@@ -237,6 +376,9 @@ def main(kwargs: DictConfig):
         log_config,
         local_rank,
         rank,
+        custom_optimizer=my_optim,
+        resume_epoch=resume_epoch,
+        resume_epoch_step=resume_skip_steps,
     )
     if rank==0:
         [logger.info(f'Key: {k}, Value: {v}') for k, v in results.items()]

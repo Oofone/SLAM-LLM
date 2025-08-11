@@ -35,14 +35,48 @@ def model_factory(train_config, model_config, **kwargs):
         **kwargs,
     )
 
+    # logger.info("Before loading ckpts")
+    # logger.info(model)
+    # logger.info("Encoder conv1 weight")
+    # logger.info(model.encoder.conv1.weight)
+    # logger.info("Projector linear1 weight")
+    # logger.info(model.encoder_projector.linear1.weight)
+    # logger.info("LLM self_attm layer0 k_proj weight")
+    # logger.info(model.llm.base_model.model.model.layers[0].self_attn.k_proj.lora_A.default.weight)
+    
+    preload_ckpt_path = kwargs.get(
+        "preload_ckpt_path", None
+    )  # FIX(MZY): load model ckpt(mainly projector, related to model_checkpointing/checkpoint_handler.py: save_model_checkpoint_peft)
+    if preload_ckpt_path is not None:
+        logger.info("loading audio encoder parts from: {}".format(preload_ckpt_path))
+        preload_ckpt_dict = torch.load(preload_ckpt_path, map_location="cpu")
+        missing, unexp = model.load_state_dict(preload_ckpt_dict, strict=False)
+        logger.info(f"Expected but missing keys: {len(missing)} (this is normal as only trainable params are saved)")
+        logger.info(f"Unexpected but present keys: {len(unexp)} (this is unexpected as all saved params should be loaded); Below:")
+        logger.info(unexp)
+    else:
+        logger.info("Skipping loading audio encoder parts")
     ckpt_path = kwargs.get(
         "ckpt_path", None
     )  # FIX(MZY): load model ckpt(mainly projector, related to model_checkpointing/checkpoint_handler.py: save_model_checkpoint_peft)
     if ckpt_path is not None:
         logger.info("loading other parts from: {}".format(ckpt_path))
         ckpt_dict = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt_dict, strict=False)
-        
+        missing, unexp = model.load_state_dict(ckpt_dict, strict=False)
+        logger.info(f"Expected but missing keys: {len(missing)} (this is normal as only trainable params are saved)")
+        logger.info(f"Unexpected but present keys: {len(unexp)} (this is unexpected as all saved params should be loaded); Below:")
+        logger.info(unexp)
+    else:
+        logger.info("Skipping loading other model parts")
+
+    # logger.info("After loading ckpts")
+    # logger.info(model)
+    # logger.info("Encoder conv1 weight")
+    # logger.info(model.encoder.conv1.weight)
+    # logger.info("Projector linear1 weight")
+    # logger.info(model.encoder_projector.linear1.weight)
+    # logger.info("LLM self_attm layer0 k_proj weight")
+    # logger.info(model.llm.base_model.model.model.layers[0].self_attn.k_proj.lora_A.default.weight)
 
     print_model_size(
         model,

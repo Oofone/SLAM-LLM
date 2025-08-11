@@ -60,7 +60,7 @@ class MultiTaskDataset(IterableDataset):
         assert self.input_type in ["raw", "mel"], "input_type must be one of [raw, mel]" 
 
     def __iter__(self):
-        multitask_task_path = os.path.join(self.data_path,"multitask.jsonl")
+        multitask_task_path = os.path.join(self.data_path, "multitask.jsonl")
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:  # Not in the multi-processing environment of DataLoader.
             num_workers = 1
@@ -85,10 +85,15 @@ class MultiTaskDataset(IterableDataset):
             for line in f_task:
                 if (data_index % total_num_workers) == worker_rank:
                     item = json.loads(line.strip())
-                    ark_path = item["path"]
-                    numpy_array = kaldiio.load_mat(ark_path)
-                    audio_raw = numpy_array[1].astype(np.float32) / 32768
-                    if len(audio_raw) / self.audio_sample_rate > self.max_audio_length: 
+                    item_path = item["path"]
+                    if item_path.endswith(".ark") or item_path.endswith(".mat"):
+                        numpy_array = kaldiio.load_mat(item_path)
+                        audio_raw = numpy_array[1].astype(np.float32) / 32768
+                    else:
+                        waveform, sr = torchaudio.load(item_path)
+                        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+                        audio_raw = waveform[0].numpy()
+                    if len(audio_raw) / 16000 > 30: 
                         continue
                     key = item["key"]
                     target = item["target"]
@@ -145,14 +150,26 @@ class MultiTaskDataset(IterableDataset):
                         label_mask = labels_ids.ge(0)  # [False,False,True,True]
                         example_ids[~example_mask] = 0  # [audio,prompt,answer,eos]
                         labels_ids[~label_mask] = self.IGNORE_INDEX  # [-100,-100,answer,eos]
-                        yield {
-                            "input_ids": example_ids,
-                            "labels": labels_ids,
-                            "attention_mask": example_mask,
-                            "audio": audio_raw if self.input_type == "raw" else None,
-                            "audio_mel": audio_mel if self.input_type == "mel" else None,
-                            'audio_length': audio_length,
-                        }
+                        if self.split in ["val", "test"]:
+                            yield {
+                                "input_ids": example_ids,
+                                "labels": labels_ids,
+                                "attention_mask": example_mask,
+                                "audio": audio_raw if self.input_type == "raw" else None,
+                                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                                'audio_length': audio_length,
+                                'key': key,
+                                'target': target,
+                            }
+                        else:
+                            yield {
+                                "input_ids": example_ids,
+                                "labels": labels_ids,
+                                "attention_mask": example_mask,
+                                "audio": audio_raw if self.input_type == "raw" else None,
+                                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                                'audio_length': audio_length,
+                            }
                 data_index += 1      
             
     def pad(self, sequence, max_length, padding_idx=0):
@@ -203,7 +220,7 @@ class MultiTaskDataset(IterableDataset):
         for line, sample in enumerate(samples):
             modality_mask[line, :sample['audio_length']] = 1
 
-        if self.inference_mode:
+        if self.inference_mode or self.split in ["val", "test"]:
             keys = [s['key'] for s in samples]
             targets = [s['target'] for s in samples]
 
@@ -221,16 +238,30 @@ class MultiTaskDataset(IterableDataset):
 
         labels = torch.stack([self.pad(s['labels'], input_ids_max_length, self.IGNORE_INDEX)
                                 for s in samples])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "audio": audio_raw if self.input_type == "raw" else None,
-            "audio_mask": audio_mask if self.input_type == "raw" else None,
-            "audio_mel": audio_mel if self.input_type == "mel" else None,
-            "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
-            "modality_mask": modality_mask
-        }
+        if self.split in ["val", "test"]:
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mask": audio_mask if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
+                "modality_mask": modality_mask,
+                "keys": keys,
+                "targets": targets
+            }
+        else:
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mask": audio_mask if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
+                "modality_mask": modality_mask
+            }
 
 class MultiTaskDynamicBatchDataset(IterableDataset):
     def __init__(self, dataset: IterableDataset, window_class) -> None:

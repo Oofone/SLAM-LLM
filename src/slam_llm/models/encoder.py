@@ -8,7 +8,7 @@ from dataclasses import dataclass
 class WhisperWrappedEncoder:
     
     @classmethod
-    def load(cls, model_config):
+    def load(cls, model_config, train_config):
         
         def extract_variable_length_features(self, x: torch.Tensor):
             """
@@ -31,16 +31,21 @@ class WhisperWrappedEncoder:
 
         if model_config.whisper_decode:
             import whisper
-            whisper_model = whisper.load_model(name=model_config.encoder_path, device='cpu')
+            whisper_model = whisper.load_model(name=model_config.encoder_path, device='cpu', download_root=model_config.encoder_cache_dir if model_config.encoder_cache_dir else None)
             whisper_model.encoder.extract_variable_length_features = types.MethodType(extract_variable_length_features, whisper_model.encoder)
             return whisper_model
 
         if model_config.encoder_path_hf is not None:
             from transformers import WhisperModel
-            encoder = WhisperModel.from_pretrained(model_config.encoder_path_hf,torch_dtype=torch.bfloat16).encoder
+            torch_dtype = torch.float16 if train_config.get("use_fp16", False) else torch.float32
+            print("Loading HuggingFace Whisper with precision", torch_dtype)
+            if model_config.encoder_cache_dir is not None:
+                encoder = WhisperModel.from_pretrained(model_config.encoder_path_hf, torch_dtype=torch_dtype, cache_dir=model_config.encoder_cache_dir).encoder
+            else:
+                encoder = WhisperModel.from_pretrained(model_config.encoder_path_hf, torch_dtype=torch_dtype).encoder
         else:
             import whisper
-            encoder = whisper.load_model(name=model_config.encoder_path, device='cpu').encoder
+            encoder = whisper.load_model(name=model_config.encoder_path, device='cpu', download_root=model_config.encoder_cache_dir if model_config.encoder_cache_dir else None).encoder
             encoder.extract_variable_length_features = types.MethodType(extract_variable_length_features, encoder)
         return encoder
 

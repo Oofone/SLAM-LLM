@@ -9,8 +9,10 @@ from aispeech_asr_config import ModelConfig, TrainConfig, DataConfig, LogConfig,
 from slam_llm.utils.deepspeed_utils import deepspeed_main_wrapper
 
 import sys
+
 @dataclass
 class RunConfig:
+    name: str = field(default="experiment_name", metadata={"help": "The name of the experiment"})
     dataset_config: DataConfig = field(default_factory=DataConfig)
     model_config: ModelConfig = field(default_factory=ModelConfig)
     train_config: TrainConfig = field(default_factory=TrainConfig)
@@ -18,6 +20,9 @@ class RunConfig:
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     debug: bool = field(default=False, metadata={"help": "Use pdb when true"})
     metric: str = field(default="acc", metadata={"help": "The metric for evaluation"})
+    preload_ckpt_path: Optional[str] = field(
+        default=None, metadata={"help": "The path to Audio Encoder checkpoint"}
+    )
     ckpt_path: Optional[str] = field(
         default=None, metadata={"help": "The path to projector checkpoint"}
     )

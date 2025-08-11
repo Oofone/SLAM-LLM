@@ -5,6 +5,8 @@ from pathlib import Path
 from datetime import datetime
 import torch
 import time
+import random
+import numpy as np
 from collections import OrderedDict
 from deepspeed.utils.zero_to_fp32 import (
     convert_zero_checkpoint_to_fp32_state_dict)
@@ -166,22 +168,29 @@ def save_model_checkpoint(
         
         logger.info(f"model checkpoint saved for epoch {epoch} at {save_full_path}\n")
 
-def save_model_checkpoint_deepspeed(model, cfg, checkpoint_name="checkpoint"):
+def save_model_checkpoint_deepspeed(model, rank, cfg, checkpoint_name="checkpoint", epoch=0, step=0):
     logger.info(f"--> saving model ...")
-    save_dir = os.path.join(cfg.output_dir, checkpoint_name)
-    dist.barrier()
-    if os.environ["RANK"] == "0":
-        os.makedirs(save_dir, exist_ok=True)
-    dist.barrier()
-    # save_full_path = os.path.join(save_dir, "model.pt")
-    save_full_path = save_dir
+    save_full_path = os.path.join(cfg.output_dir, checkpoint_name)
+    os.makedirs(save_full_path, exist_ok=True)
+
+    # Save model, optimizer, scheduler
     model.save_checkpoint(save_dir=save_full_path, exclude_frozen_parameters=True)
-    dist.barrier()
-    if os.environ["RANK"] == "0":
-        convert_zero_checkpoint_to_fp32_state_dict(save_full_path,save_full_path)
-    dist.barrier()
-    logger.info(f"encoder saved at {save_full_path}_model")
-      
+    logger.info(f"Model, optimizer, scheduler saved at {save_full_path}")
+
+    if rank == 0:
+        training_state = {
+            "epoch": epoch,
+            "step": step,
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all(),
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            }
+        }
+        torch.save(training_state, os.path.join(save_full_path, "training_state.pt"))
+        logger.info(f"RANK 0: Resumable training state saved at {save_full_path}")
+
 def save_model_checkpoint_peft(model, optimizer, rank, cfg, checkpoint_name="checkpoint", save_trainable_only=True):
     logger.info(f"--> saving model ...")
     save_dir = os.path.join(cfg.output_dir, checkpoint_name)

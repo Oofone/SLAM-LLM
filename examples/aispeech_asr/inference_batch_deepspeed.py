@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from aispeech_asr_config import ModelConfig, TrainConfig, DataConfig, LogConfig, FSDPConfig
 import sys
+import os
 from slam_llm.utils.deepspeed_utils import deepspeed_main_wrapper
 @dataclass
 class RunConfig:
@@ -21,6 +22,9 @@ class RunConfig:
         default="output/decode_log",
         metadata={"help": "The prefix for the decode output"},
     )
+    preload_ckpt_path: Optional[str] = field(
+        default=None, metadata={"help": "The path to Audio Encoder checkpoint"}
+    )
     ckpt_path: str = field(
         default="output/model.pt", metadata={"help": "The path to projector checkpoint"}
     )
@@ -30,6 +34,7 @@ class RunConfig:
             "help": "The path to peft checkpoint, should be a directory including adapter_config.json"
         },
     )
+    name: Optional[str] = None
 
 @deepspeed_main_wrapper(config_name=None, version_base=None)
 def main_hydra(cfg: DictConfig):
@@ -48,6 +53,7 @@ def main_hydra(cfg: DictConfig):
     log_level = getattr(logging, kwargs.get("log_level", "INFO").upper())
     
     logging.basicConfig(level=log_level)
+    print("MASTER_PORT", os.environ.get('MASTER_PORT', None))
     
     if kwargs.get("debug", False):
         import pdb;

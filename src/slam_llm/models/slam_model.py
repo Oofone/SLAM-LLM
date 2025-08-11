@@ -73,7 +73,7 @@ def setup_encoder(train_config, model_config, **kwargs):
         encoder_name = encoder_list[0]
         if encoder_name == "whisper" or encoder_name == "qwen-audio":
             from slam_llm.models.encoder import WhisperWrappedEncoder
-            encoder = WhisperWrappedEncoder.load(model_config)
+            encoder = WhisperWrappedEncoder.load(model_config, train_config)
         if encoder_name == "beats": 
             from slam_llm.models.encoder import BEATsEncoder
             encoder = BEATsEncoder.load(model_config)
@@ -106,6 +106,10 @@ def setup_encoder(train_config, model_config, **kwargs):
             from slam_llm.models.encoder import HfTextEncoder
             encoder = HfTextEncoder.load(model_config)
     print_module_size(encoder, encoder_name, int(os.environ["RANK"]) if train_config.enable_fsdp or train_config.enable_ddp else 0)
+
+    for name, param in encoder.named_parameters():
+        if param.dtype != torch.float32:
+            print(f"{name} not expected dtype; is {param.dtype}")
 
     if train_config.freeze_encoder:
         for name, param in encoder.named_parameters(): 
@@ -145,6 +149,7 @@ def setup_llm(train_config, model_config, **kwargs):
                     load_in_8bit=True if train_config.quantization else None,
                     device_map="auto" if train_config.quantization else None,
                     use_cache=use_cache,
+                    cache_dir=model_config.cache_dir if model_config.cache_dir else None,
                 )
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -152,10 +157,14 @@ def setup_llm(train_config, model_config, **kwargs):
                     load_in_8bit=True if train_config.quantization else None,
                     device_map="auto" if train_config.quantization else None,
                     use_cache=use_cache,
+                    cache_dir=model_config.cache_dir if model_config.cache_dir else None,
                 )
         else:
             llama_config = AutoConfig.from_pretrained(model_config.llm_path)
             llama_config.use_cache = use_cache
+            if model_config.cache_dir:
+                llama_config.cache_dir = model_config.cache_dir
+
             # with torch.device("meta"):
             if "aya" in model_config.llm_name.lower():
                 model = AutoModelForSeq2SeqLM(llama_config)
@@ -176,6 +185,7 @@ def setup_llm(train_config, model_config, **kwargs):
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
                 use_cache=use_cache,
+                cache_dir=model_config.cache_dir if model_config.cache_dir else None,
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
@@ -183,6 +193,7 @@ def setup_llm(train_config, model_config, **kwargs):
                 load_in_8bit=True if train_config.quantization else None,
                 device_map="auto" if train_config.quantization else None,
                 use_cache=use_cache,
+                cache_dir=model_config.cache_dir if model_config.cache_dir else None,
             )
     if (train_config.enable_fsdp or train_config.enable_ddp) and train_config.use_fast_kernels:
         """
@@ -291,6 +302,7 @@ class slam_model(nn.Module):
                 output_attentions: Optional[bool] = None,
                 output_hidden_states: Optional[bool] = None,
                 return_dict: Optional[bool] = None,
+                return_forward_outputs: Optional[bool] = None,
                 **kwargs,
                 ):
         audio_mel = kwargs.get("audio_mel", None)
@@ -318,7 +330,13 @@ class slam_model(nn.Module):
                 self.encoder.eval()
 
             if self.model_config.encoder_name == "whisper":
-                encoder_outs = self.encoder.extract_variable_length_features(audio_mel.permute(0, 2, 1)) # bs*seq*dim
+                if hasattr(self.encoder, "extract_variable_length_features"):
+                    encoder_outs = self.encoder.extract_variable_length_features(audio_mel.permute(0, 2, 1)) # bs*seq*dim
+                else:
+                    encoder_outs = self.encoder(audio_mel.permute(0, 2, 1)) # bs*seq*dim
+                if not isinstance(encoder_outs, torch.Tensor):
+                    if hasattr(encoder_outs, "last_hidden_state"):
+                        encoder_outs = encoder_outs.last_hidden_state
             if self.model_config.encoder_name == "beats":
                 encoder_outs, audio_mel_post_mask = self.encoder.extract_features(audio_mel, audio_mel_mask) # bs*seq*dim
             if self.model_config.encoder_name == "eat":
@@ -391,7 +409,7 @@ class slam_model(nn.Module):
             
             inputs_embeds = encoder_outs_pad + inputs_embeds * (~modality_mask[:, :, None])
 
-        if kwargs.get("inference_mode", False):
+        if kwargs.get("inference_mode", False) and not return_forward_outputs:
             return inputs_embeds, attention_mask
 
         if zh_data is not None and en_data is not None:
@@ -404,7 +422,10 @@ class slam_model(nn.Module):
                     preds = torch.argmax(model_outputs.logits, -1)
                     acc = compute_accuracy(preds.detach()[:, :-1], labels.detach()[:, 1:], ignore_label=-100)
 
-        return model_outputs, acc
+        if kwargs.get("inference_mode", False) and return_forward_outputs:
+            return model_outputs, acc, inputs_embeds, attention_mask
+        else:
+            return model_outputs, acc
     
     @torch.no_grad()
     def generate(self,
@@ -418,23 +439,42 @@ class slam_model(nn.Module):
                 output_attentions: Optional[bool] = None,
                 output_hidden_states: Optional[bool] = None,
                 return_dict: Optional[bool] = None,
+                return_forward_outputs: Optional[bool] = None,
                 **kwargs,
                 ):
         kwargs["inference_mode"] = True
 
-        inputs_embeds, attention_mask = self.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
+        model_outputs_tf = None
+        acc_tf = None
+        if return_forward_outputs:
+            model_outputs_tf, acc_tf, inputs_embeds, attention_mask = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                return_forward_outputs=return_forward_outputs,
+                **kwargs,
+            )
+        else:
+            inputs_embeds, attention_mask = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
 
         model_outputs = self.llm.generate(
             inputs_embeds=inputs_embeds,
@@ -447,10 +487,14 @@ class slam_model(nn.Module):
             repetition_penalty=kwargs.get("repetition_penalty", 1.0),
             length_penalty=kwargs.get("length_penalty", 1.0),
             temperature=kwargs.get("temperature", 1.0),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 4),
             attention_mask=attention_mask,
             bos_token_id=self.tokenizer.bos_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id
         )
 
-        return model_outputs
+        if return_forward_outputs:
+            return model_outputs_tf, acc_tf, model_outputs
+        else:
+            return model_outputs

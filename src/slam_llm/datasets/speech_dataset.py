@@ -2,6 +2,7 @@ import os.path as osp
 import random
 import json, yaml
 import copy
+import re
 
 import numpy as np
 from scipy import signal
@@ -11,7 +12,65 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset
 import whisper
+from pathlib import Path
 from slam_llm.utils.compute_utils import calculate_output_length_1d
+from slam_llm.utils.dataset_utils import load_module_from_py_file
+
+
+INSTRUCTION_TASKS = set(["SQA"])
+
+
+def get_custom_data_transform(custom_data_transform_config: str, logger = None):
+    if ":" in custom_data_transform_config:
+        module_path, func_name = custom_data_transform_config.split(":")
+    else:
+        raise ValueError(f"Custom data transform config {custom_data_transform_config} should contain ':'.")
+
+    if not module_path.endswith(".py"):
+        raise ValueError(f"Dataset file {module_path} is not a .py file.")
+    
+    module_path = Path(module_path)
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Dataset py file {module_path.as_posix()} does not exist or is not a file.")
+
+    module = load_module_from_py_file(module_path.as_posix())
+    try:
+        return getattr(module, func_name)
+    except AttributeError as e:
+        if logger:
+            logger.info(f"It seems like the given method name ({func_name}) is not present in the model .py file ({module_path.as_posix()}).")
+        else:
+            print(f"It seems like the given method name ({func_name}) is not present in the model .py file ({module_path.as_posix()}).")
+        raise e
+
+
+def clean_text_transcript(text: str) -> str:
+    # 1. Remove XML-style tags like <s/>, <en>, </en>
+    text = re.sub(r"<[^/>]+/>", "", text)       # Remove self-closing tags
+    text = re.sub(r"<[^>]+>", "", text)         # Remove open/close tags
+
+    # 2. Remove non-semantic (xxx) phrases like (ppl), (laugh)
+    text = re.sub(r"\([^)]*\)", "", text)
+
+    # 3. Replace [xxx] with xxx (keep filler content, drop brackets)
+    text = re.sub(r"\[([^\]]+)\]", r"\1", text)
+
+    # 4. Remove garbage tokens:
+    #    - Alphanumeric clusters (e.g., a1b2c3, 9ppb)
+    #    - Letter-symbol mixtures (e.g., s/<", x#x)
+    text = re.sub(r"\b[a-zA-Z]*[\d]+[a-zA-Z\d]*\b", "", text)    # alphanum
+    text = re.sub(r"\b[a-zA-Z]*[^\w\s]+[a-zA-Z]*\b", "", text)   # letter-symbol
+
+    # 5. Remove placeholder tokens
+    text = text.replace("--EMPTY--", "").replace("<unk>", "")
+
+    # 6. Normalize whitespace and lowercase
+    text = re.sub(r"\s+", " ", text).strip().lower()
+
+    # 7. Remove remaining non-alphanumeric characters (except spaces)
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+
+    return text
 
 
 class SpeechDatasetJsonl(torch.utils.data.Dataset):
@@ -24,9 +83,18 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
         super().__init__()
         self.dataset_config = dataset_config
         self.tokenizer = tokenizer
-        # data_parallel_size = dist.get_world_size()
-        data_parallel_size = 1
-        
+        self.split = split
+        self.multitask_prompt_list = {}
+        self.append_info_tasks = dataset_config.append_info_tasks
+        with open(dataset_config.multitask_prompt_path) as f_prompt:
+            for line in f_prompt:
+                item = json.loads(line.strip())
+                if item["task"] in self.multitask_prompt_list:
+                    self.multitask_prompt_list[item["task"]].append(item["prompt"])
+                else:
+                    self.multitask_prompt_list[item["task"]] = [item["prompt"]]
+        print(f"[Prompt] {self.multitask_prompt_list}")
+
         # self.data_list = contents
         self.IGNORE_INDEX = -100  # The default setting in CrossEntropyLoss
         self.prompt = dataset_config.get("prompt", None)
@@ -43,26 +111,80 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
         #     "Transform the spoken words into text accurately. ",
         #     "How about putting the speech's content into writing? "
         # ]
-        self.prompt_template = "USER: {}\n ASSISTANT:"
+        self.prompt_template = dataset_config.get("prompt_style", "{}")
         self.answer_template = "{}"
         self.fix_length_audio = dataset_config.get("fix_length_audio", -1)
         self.inference_mode = dataset_config.get("inference_mode", False)
         self.normalize = dataset_config.get("normalize", False)
         self.input_type = dataset_config.get("input_type", None)
+        self.max_eval_samples = dataset_config.get("max_eval_samples", None)
+        self.do_text_norm = False
+        if self.split == "train":
+            self.do_text_norm = dataset_config.get("text_norm_train", False)
+        elif self.split in ["val", "test"]:
+            self.do_text_norm = dataset_config.get("text_norm_eval", False)
+        self.data_transform = dataset_config.get("custom_data_transform_config", None)
+        if self.data_transform:
+            self.data_transform = get_custom_data_transform(self.data_transform)
         assert self.input_type in ["raw", "mel"], "input_type must be one of [raw, mel]" 
 
         self.data_list = []
+        duration = None
+        total_duration = 0.0
+        count = 0
         if split == "train":
             with open(dataset_config.train_data_path, encoding='utf-8') as fin:
                 for line in fin:
                     data_dict = json.loads(line.strip())
+                    if self.data_transform:
+                        data_dict = self.data_transform(data_dict)
+                    if "duration" in data_dict:
+                        duration = data_dict['duration']
+                        if duration > 30:
+                            continue
+                        else:
+                            total_duration += duration
                     self.data_list.append(data_dict)
-        else:
+                    count += 1
+        elif split == "val":
             with open(dataset_config.val_data_path, encoding='utf-8') as fin:
                 for line in fin:
                     data_dict = json.loads(line.strip())
+                    if self.data_transform:
+                        data_dict = self.data_transform(data_dict)
+                    if "duration" in data_dict:
+                        duration = data_dict['duration']
+                        if duration > 30:
+                            continue
+                        else:
+                            total_duration += duration
                     self.data_list.append(data_dict)
+                    count += 1
+                    if self.max_eval_samples and count >= self.max_eval_samples:
+                        break
+        elif split == "test":
+            with open(dataset_config.test_data_path, encoding='utf-8') as fin:
+                for line in fin:
+                    data_dict = json.loads(line.strip())
+                    if self.data_transform:
+                        data_dict = self.data_transform(data_dict)
+                    if "duration" in data_dict:
+                        duration = data_dict['duration']
+                        if duration > 30:
+                            continue
+                        else:
+                            total_duration += duration
+                    self.data_list.append(data_dict)
+                    count += 1
+                    if self.max_eval_samples and count >= self.max_eval_samples:
+                        break
+        else:
+            raise ValueError("split must be train val test")
 
+        if duration and total_duration != 0.0:
+            print(f"{split} data loaded; [{count}] rows totalling [{total_duration/3600.0:.2f} hrs]")
+        else:
+            print(f"{split} data loaded; [{count}] rows")
         # # debug
         # with open(dataset_config.train_data_path, encoding='utf-8') as fin:
         #         for line in fin:
@@ -85,9 +207,15 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
     
     def __getitem__(self, index):
         data_dict = self.data_list[index]
-        audio_path = data_dict.get("source")
-        target = data_dict.get("target", None)
-        task = data_dict.get("prompt", "ASR")
+        audio_path = data_dict.get("path")
+        if data_dict.get("target", None) is not None:
+            if self.do_text_norm:
+                target = clean_text_transcript(data_dict.get("target", None))
+            else:
+                target = data_dict.get("target")
+        else:
+            target = None
+        task = data_dict.get("task", "ASR")
         key = data_dict.get("key", None)
 
         audio_raw = whisper.load_audio(audio_path)
@@ -109,10 +237,14 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
         audio_pseudo = torch.full((audio_length,), -1) # placeholder
 
         prompt = self.prompt
+        # Use instruction from each record if exists for SQA-type tasks
+        if task in INSTRUCTION_TASKS and "instruction" in data_dict:
+            prompt = data_dict.get("instruction", None)
         if prompt is None:
-            # prompt = random.choice(self.prompt_library)
-            # prompt = "Transcribe speech to text. "
-            prompt = "Transcribe speech to text. Output the transcription directly without redundant content. Ensure that the output is not duplicated. "
+            # prompt = "Transcribe speech to text. Output the transcription directly without redundant content. Ensure that the output is not duplicated. "
+            prompt = random.choice(self.multitask_prompt_list[task])
+            if task in self.append_info_tasks:
+                prompt = prompt.format(data_dict[task])
         prompt = self.prompt_template.format(prompt)
         prompt_ids = self.tokenizer.encode(prompt)
         prompt_length = len(prompt_ids)
@@ -150,15 +282,28 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
         example_ids[~example_mask] = 0  # [audio,prompt,answer,eos]
         labels_ids[~label_mask] = self.IGNORE_INDEX  # [-100,-100,answer,eos]
 
-        return {
-            "input_ids": example_ids,
-            "labels": labels_ids,
-            "attention_mask": example_mask,
-            "audio": audio_raw if self.input_type == "raw" else None,
-            "audio_mel": audio_mel if self.input_type == "mel" else None,
-            "audio_length": audio_length,
-            "prompt_length": prompt_length,
-        }
+        if self.split in ["val", "test"]:
+            return {
+                "input_ids": example_ids,
+                "labels": labels_ids,
+                "attention_mask": example_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                'audio_length': audio_length,
+                'key': key,
+                'target': target,
+                "prompt_length": prompt_length,
+            }
+        else:
+            return {
+                "input_ids": example_ids,
+                "labels": labels_ids,
+                "attention_mask": example_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                'audio_length': audio_length,
+                "prompt_length": prompt_length,
+            }
 
     def pad(self, sequence, max_length, padding_idx=0):
         if isinstance(sequence, (int, list, tuple)):
@@ -279,16 +424,32 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
             for index in range(len(samples))
         ])
         
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "audio": audio_raw if self.input_type == "raw" else None,
-            "audio_mask": audio_mask if self.input_type == "raw" else None,
-            "audio_mel": audio_mel if self.input_type == "mel" else None,
-            "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
-            "modality_mask": modality_mask
-        }
+        if self.split in ["val", "test"]:
+            keys = [s['key'] for s in samples]
+            targets = [s['target'] for s in samples]
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mask": audio_mask if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
+                "modality_mask": modality_mask,
+                "keys": keys,
+                "targets": targets
+            }
+        else:
+            return {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+                "audio": audio_raw if self.input_type == "raw" else None,
+                "audio_mask": audio_mask if self.input_type == "raw" else None,
+                "audio_mel": audio_mel if self.input_type == "mel" else None,
+                "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
+                "modality_mask": modality_mask
+            }
 
 
 

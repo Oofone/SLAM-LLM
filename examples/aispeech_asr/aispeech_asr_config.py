@@ -6,6 +6,7 @@ from torch.distributed.fsdp import ShardingStrategy
 @dataclass
 class ModelConfig:
     file: str = "examples/aispeech_asr/model/aispeech_asr.py:model_factory"
+    cache_dir: Optional[str] = None
     llm_name: str = "vicuna-7b-v1.5"
     llm_path: str = "PATH/to/LLAMA/7B"
     llm_type: str = "decoder_only"
@@ -15,6 +16,7 @@ class ModelConfig:
     encoder_ds_rate: int = 2
     encoder_path: Optional[str] = None
     encoder_path_hf: Optional[str] = None
+    encoder_cache_dir: Optional[str] = None
     encoder_dim: int = 1280
     encoder_projector: str = "linear"
     qformer_layers : int = 8
@@ -59,6 +61,9 @@ class TrainConfig:
     total_steps:int = 100000
     validation_interval:int = 1000
     lr:float = 1e-4
+    lr_encoder:Optional[float] = None
+    lr_projector:Optional[float] = None
+    lr_llm:Optional[float] = None
     weight_decay:float = 0.0
     gamma:float = 0.85
     seed:int = 42
@@ -86,6 +91,14 @@ class TrainConfig:
     })
     freeze_encoder:bool = False
 
+    metric: Optional[str] = None
+    custom_optimizer: Optional[str] = None
+    resume_deepspeed_dir: Optional[str] = None
+    resume_deepspeed_only_module: Optional[bool] = None
+    resume_deepspeed_optimizer: Optional[bool] = None
+    resume_deepspeed_lr_scheduler: Optional[bool] = None
+    resume_training_state: Optional[bool] = None
+
 @dataclass
 class DataConfig:
     dataset: str = "multitask_dataset"
@@ -100,6 +113,9 @@ class DataConfig:
     train_scp_file_path: str = ""
     dev_scp_file_path: str = ""
     test_scp_file_path: str = ""
+    train_data_path: str = ""
+    val_data_path: str = ""
+    test_data_path: str = ""
     train_split: str = "train"
     dev_split: str = "dev"
     test_split:str = "test"
@@ -119,6 +135,10 @@ class DataConfig:
     normalize: Optional[bool] = field(default=False, metadata={
         "help": "whether input is normalized, used for models such as wavlm"
     })
+    max_eval_samples: Optional[int] = None
+    text_norm_train: bool = False
+    text_norm_eval: bool = False
+    custom_data_transform_config: Optional[str] = None
 
 @dataclass
 class FSDPConfig:

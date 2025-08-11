@@ -23,3 +23,8 @@ examples/vsr_LRS3/scripts/decode_avhubert_vo_vicuna_7b_copy.sh
 scripts_all
 examples/hotwords_librispeech
 examples/asr_librispeech/scripts/decode_hubert_xtralarge_linear_vicuna_7b_debug.sh
+
+# Specifics for project
+examples/aispeech_asr/conf/*
+examples/aispeech_asr/scripts/*
+.hydra

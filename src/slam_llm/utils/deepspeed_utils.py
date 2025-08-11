@@ -15,6 +15,7 @@ import torch
 import torch.cuda.nccl as nccl
 import torch.distributed as dist
 from omegaconf import DictConfig
+from jiwer import wer
 from tqdm import tqdm
 from transformers import LlamaTokenizer
 from typing import Any, Callable, List, Optional
@@ -25,7 +26,7 @@ from hydra._internal.deprecation_warning import deprecation_warning
 from hydra._internal.utils import _run_hydra, get_args_parser
 from hydra.types import TaskFunction
 from hydra.core.utils import _flush_loggers, configure_log
-
+from deepspeed.runtime.engine import DeepSpeedEngine
 
 from slam_llm.utils.checkpoint_handler import (
     save_model_checkpoint,
@@ -118,7 +119,7 @@ def deepspeed_join(group_join):
         #   managed by Deepspeed in this group, it's highly likely to cause
         #   communication chaos, resulting in hard-to-troubleshoot hangs.
         dist.monitored_barrier(group=group_join,
-                               timeout=group_join.options._timeout)
+                               timeout=datetime.timedelta(seconds=1800))
     except RuntimeError as e:
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
@@ -141,7 +142,7 @@ def byte2mb(x):
 
 
 def train(
-    model,
+    model: DeepSpeedEngine,
     train_dataloader,
     eval_dataloader,
     tokenizer,
@@ -150,6 +151,9 @@ def train(
     log_config,
     local_rank=None,
     rank=None,
+    custom_optimizer=None,
+    resume_epoch=0,
+    resume_epoch_step=0,
 ):
     """
     Trains the model on the given dataloader
@@ -157,15 +161,16 @@ def train(
     Args:
         model: The model to be trained
         train_dataloader: The dataloader containing the training data
-        optimizer: The optimizer used for training
-        lr_scheduler: The learning rate scheduler
-        gradient_accumulation_steps: The number of steps to accumulate gradients before performing a backward/update operation
-        num_epochs: The number of epochs to train for
-        local_rank: The rank of the current node in a distributed setting
-        train_config: The training configuration
-        log_config: The logging configuration
         eval_dataloader: The dataloader containing the eval data
         tokenizer: tokenizer used in the eval for decoding the predicitons
+        gradient_accumulation_steps: The number of steps to accumulate gradients before performing a backward/update operation
+        train_config: The training configuration
+        log_config: The logging configuration
+        local_rank: The rank of the current process within the node in a distributed setting
+        rank: The overall rank of the current process in distributed setting
+        custom_optimizer: Maually defined optimizer if used.
+        resume_epoch: Resume epoch number if training state is loaded
+        resume_epoch_step: Resume specific step in epoch if training state is loaded
 
     Returns: results dictionary containing average training and validation perplexity and loss
     """
@@ -177,6 +182,8 @@ def train(
     if train_config.enable_ddp:
         world_size = int(os.environ["WORLD_SIZE"])
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
+    compute_wer: bool = (getattr(train_config, "metric", None) == "wer")
+    ref_optimizer = custom_optimizer if custom_optimizer else model.optimizer
 
     train_prep = []
     train_loss = []
@@ -184,23 +191,33 @@ def train(
     val_prep = []
     val_loss = []
     val_acc = []
+    val_wer = []
     epoch_times = []
     checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
     best_val_acc = 0.0
-    for epoch in range(train_config.num_epochs):
+    best_val_wer = float("inf")
+    for epoch in range(resume_epoch, train_config.num_epochs):
         dist.barrier()
         group_join = dist.new_group(
             backend="gloo", timeout=datetime.timedelta(seconds=3))
         epoch_start_time = time.perf_counter()
+        if hasattr(train_dataloader, "sampler") and hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
         with MemoryTrace() as memtrace:  # track the memory usage
             model.train()
             total_loss = 0.0
             total_acc = 0.0
             if train_config.batching_strategy != "dynamic":
                 total_length = len(train_dataloader)//gradient_accumulation_steps
-                pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
+                pbar = tqdm(
+                    colour="blue",
+                    desc=f"Training Epoch: {epoch+1}",
+                    total=total_length,
+                    dynamic_ncols=True,
+                    initial=resume_epoch_step // gradient_accumulation_steps
+                )
             else:
                 pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", dynamic_ncols=True)
             for step, batch in enumerate(train_dataloader):
@@ -211,6 +228,7 @@ def train(
                         batch[key].to(local_rank).half()
                         if isinstance(batch[key], torch.Tensor)
                         and batch[key].dtype == torch.float32
+                        and train_config.use_fp16
                         else (
                             batch[key].to(local_rank)
                             if isinstance(batch[key], torch.Tensor)
@@ -222,27 +240,25 @@ def train(
                 acc = rest[0] if rest else -1
                 loss = outputs.loss
 
-                loss = loss / gradient_accumulation_steps
-                acc = acc / gradient_accumulation_steps
+                if not torch.isfinite(loss):
+                    print(f"[Step {step}] Non-finite loss: {loss.item()}")
+
+                # loss = loss / gradient_accumulation_steps
+                # acc = acc / gradient_accumulation_steps
 
                 if log_config.use_wandb and step % log_config.log_interval == 0:
+                    wandb_log_step = (epoch * total_length + step) if train_config.batching_strategy != "dynamic" else step + 1
+                    lrs = [group['lr'] for group in ref_optimizer.param_groups]
+                    log_data = {
+                        "train_inner/train_inner_loss": loss,
+                        "train_inner/train_inner_accuracy": acc,
+                        **{f"train_lr/group_{i}": lr for i, lr in enumerate(lrs)}
+                    }
                     if train_config.enable_fsdp or train_config.enable_ddp:
                         if rank == 0:
-                            wandb.log(
-                                {
-                                    "train_inner/train_inner_loss": loss,
-                                    "train_inner/train_inner_accuracy": acc,
-                                },
-                                step=(epoch * total_length + step) if train_config.batching_strategy != "dynamic" else step + 1,
-                            )
+                            wandb.log(log_data, step=wandb_log_step)
                     else:
-                        wandb.log(
-                            {
-                                "train_inner/train_inner_loss": loss,
-                                "train_inner/train_inner_accuracy": acc,
-                            },
-                            step=(epoch * total_length + step) if train_config.batching_strategy != "dynamic" else step + 1,
-                        )
+                        wandb.log(log_data, step=wandb_log_step)
 
                 total_loss += loss.detach().float()
                 total_acc += acc
@@ -266,16 +282,23 @@ def train(
                     and train_config.run_validation
                 ):
                     eval_ppl, eval_epoch_loss, *rest = evaluation(
-                        model, train_config, eval_dataloader, local_rank, tokenizer
+                        model, train_config, eval_dataloader, local_rank, tokenizer, compute_wer=compute_wer
                     )
                     eval_epoch_acc = rest[0] if rest else -1
                     checkpoint_start_time = time.perf_counter()
 
-                    if train_config.save_model and (eval_epoch_loss < best_val_loss):
-                        checkpoint_name = f"{train_config.model_name}_epoch_{str(epoch+1)}_step_{step+1}"
-                        save_model_checkpoint_deepspeed(
-                            model, train_config, checkpoint_name
-                        )
+                    if train_config.save_model:
+                        if (eval_epoch_loss < best_val_loss):
+                            checkpoint_name = f"{train_config.model_name}_epoch_{str(epoch+1)}_step_{step+1}_vloss_{(eval_epoch_loss):.4f}"
+                            save_model_checkpoint_deepspeed(
+                                model, rank, train_config, checkpoint_name, epoch, step
+                            )
+                        elif (eval_epoch_acc > best_val_acc):
+                            logger.info("Saving ckpt due to accuracy increase")
+                            checkpoint_name = f"{train_config.model_name}_epoch_{str(epoch+1)}_step_{step+1}_vacc_{(eval_epoch_acc*100):.2f}"
+                            save_model_checkpoint_deepspeed(
+                                model, rank, train_config, checkpoint_name, epoch, step
+                            )
 
                     checkpoint_end_time = time.perf_counter() - checkpoint_start_time
                     checkpoint_times.append(checkpoint_end_time)
@@ -295,20 +318,45 @@ def train(
                                     f"best eval acc on epoch {epoch+1} is {best_val_acc}"
                                 )
                         val_acc.append(rest[0])
+                        if len(rest) > 1:
+                            eval_wer = rest[1]
+                            val_wer.append(eval_wer)
+                            if eval_wer < best_val_wer:
+                                best_val_wer = eval_wer
+                                if rank == 0:
+                                    logger.info(
+                                        f"best eval wer on epoch {epoch+1} is {best_val_wer}"
+                                    )
+                        else:
+                            val_wer.append(1.0)
                     else:
                         val_acc.append(-1)
+                        val_wer.append(1.0)
 
                     if log_config.use_wandb:
                         if rank == 0:
-                            wandb.log(
-                                {
-                                    "valid/val_epoch_loss": eval_epoch_loss,
-                                    "valid/val_perplexity": eval_ppl,
-                                    "valid/best_val_loss": best_val_loss,
-                                    "valid/val_accuracy": val_acc[-1],
-                                    "valid/val_best_accuracy": best_val_acc,
-                                }
-                            )
+                            if compute_wer:
+                                wandb.log(
+                                    {
+                                        "valid/val_epoch_loss": eval_epoch_loss,
+                                        "valid/val_perplexity": eval_ppl,
+                                        "valid/best_val_loss": best_val_loss,
+                                        "valid/val_accuracy": val_acc[-1],
+                                        "valid/val_best_accuracy": best_val_acc,
+                                        "valid/val_wer": val_wer[-1],
+                                        "valid/val_best_wer": best_val_wer,
+                                    }
+                                )
+                            else:
+                                wandb.log(
+                                    {
+                                        "valid/val_epoch_loss": eval_epoch_loss,
+                                        "valid/val_perplexity": eval_ppl,
+                                        "valid/best_val_loss": best_val_loss,
+                                        "valid/val_accuracy": val_acc[-1],
+                                        "valid/val_best_accuracy": best_val_acc,
+                                    }
+                                )
 
                 if train_config.run_test_during_validation:
                     if rank == 0:
@@ -325,7 +373,20 @@ def train(
                             )
                         logger.info("=====================================")
                     dist.barrier()
+
             pbar.close()
+            checkpoint_start_time = time.perf_counter()
+
+            if train_config.save_model:
+                logger.info(f"Saving ckpt at end of epoch {str(epoch+1)}")
+                checkpoint_name = f"{train_config.model_name}_epoch_{str(epoch+1)}_complete"
+                save_model_checkpoint_deepspeed(
+                    model, rank, train_config, checkpoint_name, epoch, step=0
+                )
+
+            checkpoint_end_time = time.perf_counter() - checkpoint_start_time
+            checkpoint_times.append(checkpoint_end_time)
+
         dist.destroy_process_group(group_join)
 
         epoch_end_time = time.perf_counter() - epoch_start_time
@@ -414,7 +475,7 @@ def train(
     return results
 
 
-def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
+def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, compute_wer = False):
     """
     Evaluates the model on the given dataloader
 
@@ -426,9 +487,11 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
 
     Returns: eval_ppl, eval_epoch_loss
     """
+
     world_size = int(os.environ["WORLD_SIZE"])
     model.eval()
     eval_preds = []
+    references = []
     eval_loss = 0.0  # Initialize evaluation loss
     eval_acc = 0.0
     autocast = (
@@ -440,45 +503,60 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
             total_length = len(eval_dataloader)
             pbar = tqdm(colour="green", desc=f"Evaluating Epoch", total=total_length, dynamic_ncols=True)
         else:
-            pbar = tqdm(colour="green", desc=f"Evaluating Epoch",  dynamic_ncols=True)
+            pbar = tqdm(colour="green", desc=f"Evaluating Epoch", dynamic_ncols=True)
         for step, batch in enumerate(eval_dataloader):
             for key in batch.keys():
                 batch[key] = (
                     batch[key].to(local_rank).half()
-                    if isinstance(batch[key], torch.Tensor) and batch[key].dtype==torch.float32
+                    if isinstance(batch[key], torch.Tensor)
+                    and batch[key].dtype==torch.float32
+                    and train_config.use_fp16
                     else (
                         batch[key].to(local_rank) if isinstance(batch[key], torch.Tensor) else batch[key]
                     )
                 )
+
             # Ensure no gradients are computed for this scope to save memory
             with torch.no_grad():
                 # Forward pass and compute loss
                 with autocast():  # (Fix:MZY): fix expected scalar type mismatch in norm
-                    outputs, *rest = model(**batch)
-                acc = rest[0] if rest else -1
-                loss = outputs.loss
+                    if compute_wer:
+                        outputs, acc_tf, model_generate_outputs = model.generate(num_beams=1, return_forward_outputs=True, **batch)
+                    else:
+                        outputs, acc_tf = model(**batch)
 
+                loss = outputs.loss
                 eval_loss += loss.detach().float()
-                eval_acc += acc
+                eval_acc += acc_tf
+
             # Decode predictions and add to evaluation predictions list
-            preds = torch.argmax(outputs.logits, -1)
-            eval_preds.extend(
-                tokenizer.batch_decode(
-                    preds.detach().cpu().numpy(), skip_special_tokens=True
-                )
-            )
+            if compute_wer:
+                eval_preds.extend(tokenizer.batch_decode(
+                    model_generate_outputs, add_special_tokens=False, skip_special_tokens=True))
+                references.extend(batch['targets'])
+
             pbar.update(1)
             pbar.set_description(
                 f"step: {step+1}/{total_length if train_config.batching_strategy != 'dynamic' else '' }, eval_loss: {eval_loss/(step+1):.4f}, eval_acc: {eval_acc/(step+1):.4f}"
             )
 
     # If there's more than one CUDA device, reduce evaluation loss across all devices
+    all_preds, all_refs = eval_preds, references
     if (
         torch.cuda.device_count() > 1
     ):
         dist.all_reduce(eval_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(eval_acc, op=dist.ReduceOp.SUM)
-
+        if compute_wer:
+            # WER metric computed only on rank 0
+            if dist.is_initialized():
+                gathered_preds = [None for _ in range(world_size)]
+                gathered_refs = [None for _ in range(world_size)]
+                dist.all_gather_object(gathered_preds, eval_preds)
+                dist.all_gather_object(gathered_refs, references)
+                all_preds = [p for sublist in gathered_preds for p in sublist]
+                all_refs = [r for sublist in gathered_refs for r in sublist]
+    
     # Compute average loss and perplexity
     eval_epoch_loss = eval_loss / (len(eval_dataloader) if train_config.batching_strategy != "dynamic" else step + 1)
     eval_epoch_acc = eval_acc / (len(eval_dataloader) if train_config.batching_strategy != "dynamic" else step + 1)
@@ -487,12 +565,23 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
     eval_ppl = torch.exp(eval_epoch_loss)
 
     # Print evaluation metrics
+    wer_score = 0.0
     if local_rank == 0:
         logger.info(f" {eval_ppl=} {eval_epoch_loss=} {eval_epoch_acc=}")
+        if compute_wer:
+            wer_score = wer(all_refs, all_preds)
+            logger.info(f"Eval WER: {wer_score:.4f}")
+
+    # Broadcast WER scores (default 0.0)
+    wer_tensor = torch.tensor(wer_score, device=local_rank)
+    dist.broadcast(wer_tensor, src=0)
+    wer_score = wer_tensor.item()
 
     model.train()
-    return eval_ppl, eval_epoch_loss, eval_epoch_acc
-
+    if not compute_wer:
+        return eval_ppl, eval_epoch_loss, eval_epoch_acc
+    else:
+        return eval_ppl, eval_epoch_loss, eval_epoch_acc, wer_score
 
 def freeze_transformer_layers(model, num_layer):
     for i, layer in enumerate(model.model.layers):
