@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import List, Optional, Tuple, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, AutoModel, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
+from transformers import PretrainedConfig
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
 from slam_llm.utils.config_utils import generate_peft_config

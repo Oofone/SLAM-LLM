@@ -263,6 +263,7 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
                 "key": key,
                 "target": target,
                 "prompt_length": prompt_length,
+                "prompt": self.tokenizer.decode(prompt_ids, skip_special_tokens=True),
             }
 
         answer = self.answer_template.format(target)
@@ -404,6 +405,7 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
         if self.inference_mode:
             keys = [s['key'] for s in samples]
             targets = [s['target'] for s in samples]
+            prompts = [s['prompt'] for s in samples]
 
             return {
                 "input_ids": input_ids,
@@ -414,7 +416,8 @@ class SpeechDatasetJsonl(torch.utils.data.Dataset):
                 "audio_mel_post_mask": audio_mel_post_mask if self.input_type == "mel" else None,
                 "modality_mask": modality_mask,
                 "keys": keys,
-                "targets": targets
+                "targets": targets,
+                "prompts": prompts
             }
 
         labels = torch.stack([

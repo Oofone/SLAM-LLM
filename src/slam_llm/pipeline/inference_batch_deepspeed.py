@@ -29,6 +29,7 @@ import torch.distributed as dist
 # from llama_recipes.configs import model_config as MODEL_CONFIG
 # from llama_recipes.configs import log_config as LOG_CONFIG
 from slam_llm.data.concatenator import ConcatDataset
+from slam_llm.utils.postprocess_text import preprocess_text_asr, preprocess_text_asr_code_imda_part4, preprocess_text_asr_code_switch_chinese
 
 # util
 from slam_llm.utils import fsdp_auto_wrap_policy
@@ -62,7 +63,7 @@ meteor_metric = evaluate.load("meteor")
 squad_metric = evaluate.load("squad")
 
 
-def clean_text_transcript(text: str) -> str:
+def clean_text_transcript_default(text: str) -> str:
     # 1. Remove XML-style tags like <s/>, <en>, </en>
     text = re.sub(r"<[^/>]+/>", "", text)       # Remove self-closing tags
     text = re.sub(r"<[^>]+>", "", text)         # Remove open/close tags
@@ -89,6 +90,26 @@ def clean_text_transcript(text: str) -> str:
     text = re.sub(r"[^a-z0-9\s]", "", text)
 
     return text
+
+
+TEXT_POSPROCESS_FUNCTION_MAP = {
+    "ENG_Eval_8k-ntu-conversation_eval": preprocess_text_asr,
+    "ENG_Eval_8k-small-sgenglish-imda2021_eval": preprocess_text_asr_code_imda_part4,
+    "ENG_Eval_gigaspeech-test_eval": preprocess_text_asr,
+    "eng_indon_yt1_eval": preprocess_text_asr,
+    "eng_indon_yt2_eval": preprocess_text_asr,
+    "eng_indon_yt3_eval": preprocess_text_asr,
+    "LibriSpeech_test-clean_eval": preprocess_text_asr,
+    "LibriSpeech_test-other_eval": preprocess_text_asr,
+    "MNSC_ASR_PART1_test": preprocess_text_asr,
+    "MNSC_ASR_PART2_test": preprocess_text_asr,
+    "MNSC_ASR_PART3_test": preprocess_text_asr,
+    "MNSC_ASR_PART4_test": preprocess_text_asr_code_imda_part4,
+    "MNSC_ASR_PART5_test": preprocess_text_asr,
+    "MNSC_ASR_PART6_test": preprocess_text_asr,
+    "IMDA_PART1-3_eval": preprocess_text_asr,
+    "IMDA_PART4-6_eval": preprocess_text_asr_code_imda_part4,
+}
 
 
 @hydra.main(config_name=None, version_base=None)  # strict=False 允许忽略未知参数)
@@ -219,6 +240,7 @@ def main(kwargs: DictConfig):
     targets = []
     targets_norm = []
     counter = 0
+    clean_text_transcript = TEXT_POSPROCESS_FUNCTION_MAP.get(os.path.basename(kwargs.get('decode_log')), clean_text_transcript_default)
     with open(error_log_path, "w", encoding="utf-8", newline="\n", buffering=1) as log_error_writer:
         with open(log_path, "w", encoding="utf-8", newline="\n", buffering=1) as log_writer:
             with torch.no_grad():
@@ -230,7 +252,7 @@ def main(kwargs: DictConfig):
                         output_text = model.tokenizer.batch_decode(model_outputs, add_special_tokens=False, skip_special_tokens=True)
                     else:
                         output_text = tokenizer.batch_decode(model_outputs, skip_special_tokens=True)
-                    for key, text, target in zip(batch["keys"], output_text, batch["targets"]):
+                    for key, text, target, prompt in zip(batch["keys"], output_text, batch["targets"], batch['prompts']):
                         text = (text or "").strip()
                         text_norm = clean_text_transcript(text)
                         target = (target or "").strip()
@@ -242,6 +264,7 @@ def main(kwargs: DictConfig):
                         if not target:
                             error_log = {
                                 "key": key,
+                                "prompt": prompt,
                                 "pred": text,
                                 "target": target,
                                 "reason": "EMPTY_REFERENCE_AFTER_STRIP"
@@ -254,6 +277,7 @@ def main(kwargs: DictConfig):
                             targets_norm.append(target_norm)
                             log = {
                                 "key": key,
+                                "prompt": prompt,
                                 "pred": text,
                                 "pred_norm": text_norm,
                                 "target": target,
@@ -284,7 +308,7 @@ def main(kwargs: DictConfig):
             wer_writer.write(f"{name} WER_Norm: {wer_norm}\n")
     elif train_config.get("metric").lower() == "sqa_all":
         # Targets and preds are lists of strings
-        assert isinstance(preds_norm, list) and isinstance(targets_norm, list)
+        assert isinstance(preds, list) and isinstance(targets, list)
 
         # For BLEU, each reference must be a list of references (even if one)
         bleu_result = bleu_metric.compute(predictions=preds, references=[[ref] for ref in targets])
